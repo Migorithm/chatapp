@@ -1,62 +1,64 @@
 use axum::{
-    extract::ws::{Message, WebSocket, WebSocketUpgrade},
-    extract::TypedHeader,
-    response::IntoResponse,
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        State,
+    },
+    response::{Html, IntoResponse},
     routing::get,
-    
-    Router,
+    Router, TypedHeader,
 };
-
-
-use std::{borrow::Cow, str::FromStr};
-use std::ops::ControlFlow;
-use std::{net::SocketAddr, path::PathBuf};
-use tower_http::{
-    services::ServeDir,
-    trace::{DefaultMakeSpan, TraceLayer},
+use futures::{sink::SinkExt, stream::StreamExt};
+use headers::authorization::Bearer;
+use std::{
+    collections::HashSet,
+    net::SocketAddr,
+    str::FromStr,
+    sync::{Arc, Mutex},
 };
-
+use tokio::sync::broadcast;
+use tower_http::trace::{DefaultMakeSpan, TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-//allows to extract the IP of connecting user
-use axum::extract::connect_info::ConnectInfo;
-use axum::extract::ws::CloseFrame;
-
-//allows to split the websocket stream into separate TX and RX branches
-use futures::{sink::SinkExt, stream::StreamExt};
-
-
-
-
+// Our shared state
+struct AppState {
+    // We require unique usernames. This tracks which usernames have been taken.
+    user_set: Mutex<HashSet<String>>,
+    // Channel used to send messages to all connected clients.
+    tx: broadcast::Sender<String>,
+}
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "example_websockets=debug,tower_http=debug".into()),
+                // ! server refers to the binary name.
+                .unwrap_or_else(|_| "server=debug".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let assets_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets");
+    // Set up application state for use with with_state().
+    let user_set = Mutex::new(HashSet::new());
+    let (tx, _rx) = broadcast::channel(100);
 
-    // build our application with some routes
+    let app_state = Arc::new(AppState { user_set, tx });
+
     let app = Router::new()
-        .fallback_service(ServeDir::new(assets_dir).append_index_html_on_directories(true))
-        .route("/ws", get(ws_handler))
-        // logging so we can see whats going on
+        .route("/", get(index))
+        .route("/ws", get(websocket_handler))
+        .with_state(app_state)
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(DefaultMakeSpan::default().include_headers(true)),
         );
 
-    // run it with hyper
-    axum::Server::bind(
-        &SocketAddr::from_str("127.0.0.1:3000").unwrap()
-    ).serve(app.into_make_service())
-    .await
-    .unwrap();
+    // tracing::debug!("listening on {}", listener.local_addr().unwrap());
+
+    axum::Server::bind(&SocketAddr::from_str("127.0.0.1:8080").unwrap())
+        .serve(app.into_make_service())
+        .await
+        .unwrap();
 }
 
 /// The handler for the HTTP request (this gets called when the HTTP GET lands at the start
@@ -64,163 +66,112 @@ async fn main() {
 /// websocket protocol will occur.
 /// This is the last point where we can extract TCP/IP metadata such as IP address of the client
 /// as well as things from HTTP headers such as user-agent of the browser etc.
-async fn ws_handler(
+async fn websocket_handler(
     ws: WebSocketUpgrade,
-    user_agent: Option<TypedHeader<headers::UserAgent>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    user_agent: Option<TypedHeader<headers::Authorization<Bearer>>>,
+    State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let user_agent = if let Some(TypedHeader(user_agent)) = user_agent {
-        user_agent.to_string()
+    let token = if let Some(TypedHeader(auth)) = user_agent {
+        auth.token().to_string()
     } else {
         String::from("Unknown browser")
     };
-    println!("`{user_agent}` at {addr} connected.");
-    // finalize the upgrade process by returning upgrade callback.
-    // we can customize the callback by sending additional info such as address.
-    ws.on_upgrade(move |socket| handle_socket(socket, addr))
+
+    println!("User Access Token: `{token:?}` ???");
+
+    ws.on_upgrade(|socket| handle_socket(socket, state))
 }
 
-/// Actual websocket statemachine (one will be spawned per connection)
-async fn handle_socket(mut socket: WebSocket, who: SocketAddr) {
-    //send a ping (unsupported by some browsers) just to kick things off and get a response
-    if socket.send(Message::Ping(vec![1, 2, 3])).await.is_ok() {
-        println!("Pinged {}...", who);
-    } else {
-        println!("Could not send ping {}!", who);
-        // no Error here since the only thing we can do is to close the connection.
-        // If we can not send messages, there is no way to salvage the statemachine anyway.
-        return;
-    }
+/// This function deals with a single websocket connection, i.e., a single
+/// connected client / user, for which we will spawn two independent tasks (for
+/// receiving / sending chat messages).
+async fn handle_socket(stream: WebSocket, state: Arc<AppState>) {
+    // By splitting, we can send and receive at the same time.
+    let (mut sender, mut receiver) = stream.split();
 
-    // receive single message from a client (we can either receive or send with socket).
-    // this will likely be the Pong for our Ping or a hello message from client.
-    // waiting for message from a client will block this task, but will not block other client's
-    // connections.
-    if let Some(msg) = socket.recv().await {
-        if let Ok(msg) = msg {
-            if process_message(msg, who).is_break() {
+    // Username gets set in the receive loop, if it's valid.
+    let mut username = String::new();
+
+    // Loop until a text message is found.
+    while let Some(Ok(message)) = receiver.next().await {
+        if let Message::Text(name) = message {
+            // If username that is sent by client is not taken, fill username string.
+            println!("{name}");
+            check_username(&state, &mut username, &name);
+
+            // If not empty we want to quit the loop else we want to quit function.
+            if !username.is_empty() {
+                break;
+            } else {
+                // Only send our client that username is taken.
+                let _ = sender
+                    .send(Message::Text(String::from("Username already taken.")))
+                    .await;
+
                 return;
             }
-        } else {
-            println!("client {who} abruptly disconnected");
-            return;
         }
     }
 
-    // Since each client gets individual statemachine, we can pause handling
-    // when necessary to wait for some external event (in this case illustrated by sleeping).
-    // Waiting for this client to finish getting its greetings does not prevent other clients from
-    // connecting to server and receiving their greetings.
-    for i in 1..5 {
-        if socket
-            .send(Message::Text(format!("Hi {i} times!")))
-            .await
-            .is_err()
-        {
-            println!("client {who} abruptly disconnected");
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
+    // We subscribe *before* sending the "joined" message, so that we will also
+    // display it to the currently-joining client.
+    let mut rx = state.tx.subscribe();
 
-    // By splitting socket we can send and receive at the same time. In this example we will send
-    // unsolicited messages to client based on some sort of server's internal event (i.e .timer).
-    let (mut sender, mut receiver) = socket.split();
+    // Now send the "joined" message to ALL subscribers.
+    let msg = format!("{} joined.", username);
+    tracing::debug!("{}", msg);
+    let _ = state.tx.send(msg);
 
-    // Spawn a task that will push several messages to the client (does not matter what client does)
+    // Spawn the first task that will receive broadcast messages and send text
+    // messages over the websocket to our client.
     let mut send_task = tokio::spawn(async move {
-        let n_msg = 20;
-        for i in 0..n_msg {
-            // In case of any websocket error, we exit.
-            if sender
-                .send(Message::Text(format!("Server message {i} ...")))
-                .await
-                .is_err()
-            {
-                return i;
-            }
-
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        }
-
-        println!("Sending close to {who}...");
-        if let Err(e) = sender
-            .send(Message::Close(Some(CloseFrame {
-                code: axum::extract::ws::close_code::NORMAL,
-                reason: Cow::from("Goodbye"),
-            })))
-            .await
-        {
-            println!("Could not send Close due to {}, probably it is ok?", e);
-        }
-        n_msg
-    });
-
-    // This second task will receive messages from client and print them on server console
-    let mut recv_task = tokio::spawn(async move {
-        let mut cnt = 0;
-        while let Some(Ok(msg)) = receiver.next().await {
-            cnt += 1;
-            // print message and break if instructed to do so
-            if process_message(msg, who).is_break() {
+        while let Ok(msg) = rx.recv().await {
+            // In any websocket error, break loop.
+            if sender.send(Message::Text(msg)).await.is_err() {
                 break;
             }
         }
-        cnt
     });
 
-    // If any one of the tasks exit, abort the other.
-    tokio::select! {
-        rv_a = (&mut send_task) => {
-            match rv_a {
-                Ok(a) => println!("{} messages sent to {}", a, who),
-                Err(a) => println!("Error sending messages {:?}", a)
-            }
-            recv_task.abort();
-        },
-        rv_b = (&mut recv_task) => {
-            match rv_b {
-                Ok(b) => println!("Received {} messages", b),
-                Err(b) => println!("Error receiving messages {:?}", b)
-            }
-            send_task.abort();
-        }
-    }
+    // Clone things we want to pass (move) to the receiving task.
+    let tx = state.tx.clone();
+    let name = username.clone();
 
-    // returning from the handler closes the websocket connection
-    println!("Websocket context {} destroyed", who);
+    // Spawn a task that takes messages from the websocket, prepends the user
+    // name, and sends them to all broadcast subscribers.
+    let mut recv_task = tokio::spawn(async move {
+        while let Some(Ok(Message::Text(text))) = receiver.next().await {
+            // Add username before message.
+            let _ = tx.send(format!("{}: {}", name, text));
+        }
+    });
+
+    // If any one of the tasks run to completion, we abort the other.
+    tokio::select! {
+        _ = (&mut send_task) => recv_task.abort(),
+        _ = (&mut recv_task) => send_task.abort(),
+    };
+
+    // Send "user left" message (similar to "joined" above).
+    let msg = format!("{} left.", username);
+    tracing::debug!("{}", msg);
+    let _ = state.tx.send(msg);
+
+    // Remove username from map so new clients can take it again.
+    state.user_set.lock().unwrap().remove(&username);
 }
 
-/// helper to print contents of messages to stdout. Has special treatment for Close.
-fn process_message(msg: Message, who: SocketAddr) -> ControlFlow<(), ()> {
-    match msg {
-        Message::Text(t) => {
-            println!(">>> {} sent str: {:?}", who, t);
-        }
-        Message::Binary(d) => {
-            println!(">>> {} sent {} bytes: {:?}", who, d.len(), d);
-        }
-        Message::Close(c) => {
-            if let Some(cf) = c {
-                println!(
-                    ">>> {} sent close with code {} and reason `{}`",
-                    who, cf.code, cf.reason
-                );
-            } else {
-                println!(">>> {} somehow sent close message without CloseFrame", who);
-            }
-            return ControlFlow::Break(());
-        }
+fn check_username(state: &AppState, string: &mut String, name: &str) {
+    let mut user_set = state.user_set.lock().unwrap();
 
-        Message::Pong(v) => {
-            println!(">>> {} sent pong with {:?}", who, v);
-        }
-        // You should never need to manually handle Message::Ping, as axum's websocket library
-        // will do so for you automagically by replying with Pong and copying the v according to
-        // spec. But if you need the contents of the pings you can see them here.
-        Message::Ping(v) => {
-            println!(">>> {} sent ping with {:?}", who, v);
-        }
+    if !user_set.contains(name) {
+        user_set.insert(name.to_owned());
+
+        string.push_str(name);
     }
-    ControlFlow::Continue(())
+}
+
+// Include utf-8 file at **compile** time.
+async fn index() -> Html<&'static str> {
+    Html(std::include_str!("../chat.html"))
 }

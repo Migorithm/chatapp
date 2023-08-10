@@ -17,3 +17,12 @@ tower = { version = "*", features = ["util"] }
 tower-http = { version = "*", features = ["fs", "trace"] }
 tracing = "*"
 tracing-subscriber = { version = "*", features = ["env-filter"] }
+
+
+[[bin]]
+name = "server"
+path = "src/main.rs"
+
+[[bin]]
+name = "client"
+path = "src/client.rs"
