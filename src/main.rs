@@ -12,25 +12,24 @@ use futures::{sink::SinkExt, stream::StreamExt};
 use headers::authorization::Bearer;
 
 use std::{
-    collections::HashSet,
     net::SocketAddr,
     str::FromStr,
     sync::{Arc, Mutex},
 };
-use tokio::sync::broadcast;
+use tokio::sync::broadcast::{self, Sender};
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
 // Our shared state
-struct AppState {
-    // We require unique usernames. This tracks which usernames have been taken.
-    user_set: Mutex<HashSet<String>>,
-    // Channel used to send messages to all connected clients.
+
+struct Room {
+    id: String,
     tx: broadcast::Sender<String>,
 }
-impl AppState {
-    fn broadcast_message(&self, msg: String) {
-        let _ = self.tx.send(msg);
-    }
+
+#[derive(Default)]
+struct AppState {
+    rooms: Vec<Room>,
 }
 
 #[tokio::main]
@@ -44,11 +43,7 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // Set up application state for use with with_state() this is what ensures statefulness
-    let user_set = Mutex::new(HashSet::new());
-    let (tx, _rx) = broadcast::channel(100);
-
-    let app_state = Arc::new(AppState { user_set, tx });
+    let app_state = Arc::new(Mutex::new(AppState::default()));
 
     let app = Router::new()
         .route("/", get(index))
@@ -75,7 +70,7 @@ async fn main() {
 async fn websocket_handler(
     ws: WebSocketUpgrade,
     current_user: Option<TypedHeader<headers::Authorization<Bearer>>>,
-    State(state): State<Arc<AppState>>,
+    State(state): State<Arc<Mutex<AppState>>>,
 ) -> impl IntoResponse {
     let token = if let Some(TypedHeader(auth)) = current_user {
         auth.token().to_string()
@@ -93,26 +88,31 @@ async fn websocket_handler(
 /// connected client / user, for which we will spawn two independent tasks (for
 /// receiving / sending chat messages).
 // ! Think of this as broker
-async fn handle_socket(stream: WebSocket, state: Arc<AppState>) {
+async fn handle_socket(stream: WebSocket, state: Arc<Mutex<AppState>>) {
     // By splitting, we can send and receive at the same time.
     let (mut sender, mut receiver) = stream.split();
 
     // Username gets set in the receive loop, if it's valid.
-    let mut username = String::new();
-
+    let mut user_name = String::new();
+    let mut room: Option<Sender<String>> = None;
     // Loop until a text message is found.
     while let Some(Ok(message)) = receiver.next().await {
-        if let Message::Text(name) = message {
+        if let Message::Text(enter_key) = message {
             // If username that is sent by client is not taken, fill username string.
-            check_username(&state, &mut username, &name);
+
+            let mut iterator = enter_key.split(':');
+            let (r_name, u_name) = (iterator.next().unwrap_or(""), iterator.next().unwrap_or(""));
+
+            room = Some(check_room(state, r_name));
 
             // If not empty we want to quit the loop else we want to quit function.
-            if !username.is_empty() {
+            if ![!u_name.is_empty(), !r_name.is_empty()].contains(&false) {
+                user_name = u_name.to_string();
                 break;
             } else {
                 // Only send our client that username is taken.
                 let _ = sender
-                    .send(Message::Text(String::from("Username already taken.")))
+                    .send(Message::Text(String::from("Wrong input is given.")))
                     .await;
 
                 return;
@@ -121,10 +121,11 @@ async fn handle_socket(stream: WebSocket, state: Arc<AppState>) {
     }
     // We subscribe *before* sending the "joined" message, so that we will also
     // display it to the currently-joining client.
-    let mut rx = state.tx.subscribe();
+    let room = room.take().unwrap();
+    let mut rx = room.subscribe();
 
     // Now send the "joined" message to ALL subscribers.
-    state.broadcast_message(format!("{} joined", username));
+    let _ = room.send(format!("{} joined", user_name));
 
     // Spawn the first task that will receive broadcast messages and send text
     // messages over the websocket to our client.
@@ -138,8 +139,8 @@ async fn handle_socket(stream: WebSocket, state: Arc<AppState>) {
     });
 
     // Clone things we want to pass (move) to the receiving task.
-    let tx = state.tx.clone();
-    let name = username.clone();
+    let tx = room.clone();
+    let name = user_name.clone();
 
     // Spawn a task that takes messages from the websocket, prepends the user
     // name, and sends them to all broadcast subscribers.
@@ -155,7 +156,7 @@ async fn handle_socket(stream: WebSocket, state: Arc<AppState>) {
 
                     //If user has left, send relevant message and remove the username from user_set
                     let _ = tx.send(format!("{} left.", name));
-                    state.user_set.lock().unwrap().remove(&name);
+
                     break 'recv_loop;
                 }
                 _ => break 'recv_loop,
@@ -172,13 +173,21 @@ async fn handle_socket(stream: WebSocket, state: Arc<AppState>) {
     // Remove username from map so new clients can take it again.
 }
 
-fn check_username(state: &AppState, string: &mut String, name: &str) {
-    let mut user_set = state.user_set.lock().unwrap();
+fn check_room(state: Arc<Mutex<AppState>>, room_name: &str) -> Sender<String> {
+    let mut state = state.lock().unwrap();
 
-    if !user_set.contains(name) {
-        user_set.insert(name.to_owned());
+    let rooms = &mut state.rooms;
 
-        string.push_str(name);
+    if !rooms.iter().any(|r| r.id == room_name) {
+        let (tx, _rx) = broadcast::channel(100);
+
+        rooms.push(Room {
+            id: room_name.to_string(),
+            tx: tx.clone(),
+        });
+        tx
+    } else {
+        rooms.iter().find(|r| r.id == room_name).unwrap().tx.clone()
     }
 }
 
