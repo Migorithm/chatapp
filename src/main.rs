@@ -106,7 +106,7 @@ async fn handle_socket(stream: WebSocket, state: Arc<Mutex<AppState>>) {
             room = Some(check_room(state, r_name));
 
             // If not empty we want to quit the loop else we want to quit function.
-            if ![!u_name.is_empty(), !r_name.is_empty()].contains(&false) {
+            if !u_name.is_empty() & !r_name.is_empty() {
                 user_name = u_name.to_string();
                 break;
             } else {
